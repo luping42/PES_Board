@@ -12,6 +12,10 @@
 // Ultrasonic sensor
 #include "UltrasonicSensor.h"
 
+// DC Motor
+#include "FastPWM.h"
+#include "DCMotor.h"
+
 
 bool do_execute_main_task = false; // this variable will be toggled via the user button (blue button) and
                                    // decides whether to execute the main task or not
@@ -30,8 +34,9 @@ int main()
     // set up states for state machine
     enum RobotState {
         INITIAL,
-        EXECUTION,
         SLEEP,
+        FORWARD,
+        BACKWARD,
         EMERGENCY
     } robot_state = RobotState::INITIAL;
 
@@ -53,43 +58,16 @@ int main()
     // a led has an anode (+) and a cathode (-), the cathode needs to be connected to ground via the resistor
     DigitalOut led1(PB_9);
 
-    // servo
-        Servo servo_D0(PB_D0);
-        Servo servo_D1(PB_D1);
-        float servo_input = 0.0f;
+    // create object to enable power electronics for the DC motors
+    DigitalOut enable_motors(PB_ENABLE_DCMOTORS);
+
+    // motor M1
+    FastPWM pwm_M1(PB_PWM_M1); // create FastPWM object to command motor M1
 
     // ultra sonic sensor
         UltrasonicSensor us_sensor(PB_D3);
         float us_distance_cm = 0.0f;
 
-    // min and max ultra sonic sensor reading, (us_distance_min, us_distance_max) -> (servo_min, servo_max)
-        float us_distance_min = 6.0f;
-        float us_distance_max = 40.0f;
-
-    
-
-
-        // minimal pulse width and maximal pulse width obtained from the servo calibration process
-        // futuba S3001
-        float servo_D0_ang_min = 0.0150f; // carefull, these values might differ from servo to servo
-        float servo_D0_ang_max = 0.1150f;
-        // reely S0090
-        float servo_D1_ang_min = 0.0325f;
-        float servo_D1_ang_max = 0.1175f;
-
-        // servo.setPulseWidth: before calibration (0,1) -> (min pwm, max pwm)
-        // servo.setPulseWidth: after calibration (0,1) -> (servo_D0_ang_min, servo_D0_ang_max)
-        servo_D0.calibratePulseMinMax(servo_D0_ang_min, servo_D0_ang_max);
-        servo_D1.calibratePulseMinMax(servo_D1_ang_min, servo_D1_ang_max);
-
-        // default acceleration of the servo motion profile is 1.0e6f
-        servo_D0.setMaxAcceleration(0.3f);
-        servo_D1.setMaxAcceleration(0.3f);
-/*
-        int servo_counter = 0; // define servo counter, this is an additional variable
-        // used to command the servo
-        const int loops_per_seconds = static_cast<int>(ceilf(1.0f / (0.001f * static_cast<float>(main_task_period_ms))));
-*/
 
         // mechanical button
         DigitalIn mechanical_button(PC_5); // create DigitalIn object to evaluate mechanical button, you
@@ -97,6 +75,20 @@ int main()
         mechanical_button.mode(PullUp);    // sets pullup between pin and 3.3 V, so that there
                                         // is a defined potential
 
+        const float voltage_max = 12.0f; // maximum voltage of battery packs, adjust this to
+                                         // 6.0f V if you only use one battery pack
+    
+        
+        // motor M3
+        const float gear_ratio_M3 = 78.125f; // gear ratio
+        const float kn_M3 = 180.0f / 12.0f;  // motor constant [rpm/V]
+        // it is assumed that only one motor is available, there fore
+        // we use the pins from M1, so you can leave it connected to M1
+        DCMotor motor_M3(PB_PWM_M1, PB_ENC_A_M1, PB_ENC_B_M1, gear_ratio_M3, kn_M3, voltage_max);
+        // enable the motion planner for smooth movement
+        motor_M3.enableMotionPlanner();
+        // limit max. acceleration to half of the default acceleration
+        motor_M3.setMaxAcceleration(motor_M3.getMaxAcceleration() * 0.5f);
 
 
     // start timer
@@ -106,7 +98,7 @@ int main()
     while (true) {
         main_task_timer.reset();
 
-        
+                    
 
         if (do_execute_main_task) {
 
@@ -116,81 +108,72 @@ int main()
         if (us_distance_cm_candidate > 0.0f)
             us_distance_cm = us_distance_cm_candidate;
 
-        
 
-        // enable the servos
-        if (!servo_D0.isEnabled())
-            servo_D0.enable();
-        if (!servo_D1.isEnabled())
-            servo_D1.enable();
+        // enable hardwaredriver DC motors: 0 -> disabled, 1 -> enabled
+        enable_motors = 1;
 
-        // command the servos
-        servo_D0.setPulseWidth(servo_input);
-        servo_D1.setPulseWidth(servo_input);
 
-     /*   // calculate inputs for the servos for the next cycle
-        if ((servo_input < 1.0f) &&                     // constrain servo_input to be < 1.0f
-            (servo_counter % loops_per_seconds == 0) && // true if servo_counter is a multiple of loops_per_second
-            (servo_counter != 0))                       // avoid servo_counter = 0
-            servo_input += 0.005f;
-        servo_counter++;
 
-    */
 
-        // print to the serial terminal
-        printf("Pulse width: %f \n", servo_input);
 
 
                 // state machine
         switch (robot_state) {
             case RobotState::INITIAL: {
                 printf("INITIAL\n");
-
-                // enable the servo
-                if (!servo_D0.isEnabled())
-                servo_D0.enable();
-                robot_state = RobotState::EXECUTION;
-
-                break;
-            }
-            case RobotState::EXECUTION: {
-                printf("EXECUTION\n");
-
-                // function to map the distance to the servo movement (us_distance_min, us_distance_max) -> (0.0f, 1.0f)
-                servo_input = (us_distance_cm - us_distance_min) / (us_distance_max - us_distance_min);
-                // values smaller than 0.0f or bigger than 1.0f ar constrained to the range (0.0f, 1.0f) in setPulseWidth
-                servo_D0.setPulseWidth(servo_input);
-                servo_D1.setPulseWidth(servo_input);
-
-                // if the measurement is outside the min or max limit go to SLEEP
-                if ((us_distance_cm < us_distance_min) || (us_distance_cm > us_distance_max))
-                    robot_state = RobotState::SLEEP;
-
-                // if the mechanical button is pressed go to EMERGENCY
-                if (mechanical_button.read())
-                    robot_state = RobotState::EMERGENCY;
-
+                // enable hardwaredriver dc motors: 0 -> disabled, 1 -> enabled
+                enable_motors = 1;
+                robot_state = RobotState::SLEEP;
+       
                 break;
             }
             case RobotState::SLEEP: {
                 printf("SLEEP\n");
-
-                // if the measurement is within the min and max limits go to EXECUTION
-                if ((us_distance_cm > us_distance_min) && (us_distance_cm < us_distance_max))
-                    robot_state = RobotState::EXECUTION;
-
-                // if the mechanical button is pressed go to EMERGENCY
+                // wait for the signal from the user, so to run the process 
+                // that is triggered by clicking mechanical button
+                // then go the the FORWARD state
                 if (mechanical_button.read())
-                    robot_state = RobotState::EMERGENCY;
+                robot_state = RobotState::FORWARD;
+                
 
+                break;
+            }
+            case RobotState::FORWARD: {
+                printf("FORWARD\n");
+                // press is moving forward until it reaches 2.9f rotations, 
+                // when reaching the value go to BACKWARD
+                motor_M3.setRotation(2.9f); // setting this once would actually be enough
+                // if the distance from the sensor is less than 4.5f cm,
+                // we transition to the EMERGENCY state
+                if (us_distance_cm < 4.5f)
+                    robot_state = RobotState::EMERGENCY;
+                // switching condition is sligthly smaller for robustness
+                if (motor_M3.getRotation() > 2.89f)
+                    robot_state = RobotState::BACKWARD;
+             
+                break;
+            }
+            case RobotState::BACKWARD: {
+                printf("BACKWARD\n");
+                // move backwards to the initial position
+                // and go to the SLEEP state if reached
+                motor_M3.setRotation(0.0f);
+                // switching condition is sligthly bigger for robustness
+                if (motor_M3.getRotation() < 0.01f)
+                    robot_state = RobotState::SLEEP;
+
+       
                 break;
             }
             case RobotState::EMERGENCY: {
                 printf("EMERGENCY\n");
-
-                // the transition to the emergency state causes the execution of the commands contained
-                // in the outer else statement scope, and since do_reset_all_once is true the system undergoes a reset
-                toggle_do_execute_main_fcn();
+                // disable the motion planer and
+                // move to the initial position asap
+                // then reset the system
+                motor_M3.disableMotionPlanner();
+                motor_M3.setRotation(0.0f);
+                if (motor_M3.getRotation() < 0.01f)
+                    toggle_do_execute_main_fcn();
 
                 break;
             }
@@ -198,30 +181,28 @@ int main()
 
                 break; // do nothing
             }
-        }
-
+        
         // print to the serial terminal
-        printf("US distance cm: %f \n", us_distance_cm);
+        printf("US Sensor in cm: %f, DC Motor Rotations: %f\n", us_distance_cm, motor_M3.getRotation());
 
+
+        }
 //  main else ...
         } else {
 
-        // reset variables and objects
-        led1 = 0;
-        servo_D0.disable();
-        servo_D1.disable();
-        servo_input = 0.0f;
+            // reset variables and objects
+            led1 = 0;
+            enable_motors = 0;
+            us_distance_cm = 0.0f;
+            motor_M3.setMotionPlanerPosition(0.0f);
+            motor_M3.setMotionPlanerVelocity(0.0f);
+            motor_M3.enableMotionPlanner();
+            robot_state = RobotState::INITIAL;
 
         // the following code block gets executed only once
         if (do_reset_all_once) {
             do_reset_all_once = false;
-
-            // reset variables and objects
-            led1 = 0;
-            servo_D0.disable();
-            us_distance_cm = 0.0f;
-            robot_state = RobotState::INITIAL;
-}
+            }
  
         }
 
